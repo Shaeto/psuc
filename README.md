@@ -65,3 +65,8 @@ to
 ```
 
 PLEASE do not forget to check current consumption on PS_ON pin for your PSU, for example (my!) PicoPSU consumes only 6 ma. Atmega pin maximum is 40 ma.
+
+## TODO
+
+- implement IPMI ?
+- get rid of arduino bootloader and implement watchdog ?
