@@ -3,8 +3,8 @@
 
 /*******************************************************************************
   Pico PSU Control application
-  Version: 1.00
-  Date: 01-02-2018
+  Version: 1.02
+  Date: 11-03-2018
   Author: Evgeny Sabelskiy
 
   This is a simple control application for PICO PSU
@@ -14,6 +14,7 @@
 
   Revision  Description
   ========  ===========
+  1.02      Fix gpio shutdown request signal deassertion
   1.01      Add configuration
   1.00      Initial public release (for arduino mini pro 5v)
 *******************************************************************************/
@@ -81,10 +82,12 @@ enum t_psuc_state {
   PSUC_EMERGENCY_POWER_OFF,
   // processing turn PSU ON
   PSUC_POWER_ON,
+#if PSUC_USE_CONFIRMATION_GPIO
   // read GPIO signals
   PSUC_WAIT_GPIO_READ,
   // confirmate HIGH signal on GPIO and shutdown PSU
   PSUC_WAIT_GPIO_CONFIRMATION
+#endif
 };
 
 static volatile t_psuc_state psuc_state;
@@ -166,15 +169,22 @@ void atx_poweron()
 #endif
 }
 
-void gpio_request_shutdown()
+void gpio_request_shutdown(bool on)
 {
-  // simulate a short edge and leave signal at HIGH level
-  digitalWrite(PSUC_GPIO_REQUEST_PIN, LOW);
-  delay(10);
-  digitalWrite(PSUC_GPIO_REQUEST_PIN, HIGH);
+  if (on) {
+    // simulate a short edge and leave signal at HIGH level
+    digitalWrite(PSUC_GPIO_REQUEST_PIN, LOW);
+    delay(10);
+    digitalWrite(PSUC_GPIO_REQUEST_PIN, HIGH);
 #if PSUC_DEBUG
-  Serial.println("gpio request for shutdown");
+    Serial.println("gpio request for shutdown");
 #endif
+  } else {
+    digitalWrite(PSUC_GPIO_REQUEST_PIN, LOW);
+#if PSUC_DEBUG
+    Serial.println("deassert gpio request");
+#endif
+  }
 }
 
 void power_button_rq() {
@@ -217,12 +227,16 @@ void change_state(t_psuc_state new_state)
       Serial.println("PSUC_POWER_ON");
 #endif
       break;
+#if PSUC_USE_CONFIRMATION_GPIO
     case PSUC_WAIT_GPIO_READ:
       if (psuc_state != PSUC_WAIT_GPIO_CONFIRMATION) {
         last_time_wait_alone = start_time_wait_gpio = millis();
       }
       // reset current input signals states
       reset_signals();
+      break;
+#endif
+    default:
       break;
   }
   psuc_state = new_state;
@@ -287,9 +301,13 @@ void led_control(t_psuc_state state)
       break;
     case PSUC_POWER_ON:
       break;
+#if PSUC_USE_CONFIRMATION_GPIO
     case PSUC_WAIT_GPIO_READ:
     case PSUC_WAIT_GPIO_CONFIRMATION:
       case_led_ctrl((millis() / 500) % 2 ? HIGH : LOW);
+      break;
+#endif
+    default:
       break;
   }
 }
@@ -298,6 +316,7 @@ void psu_control(t_psuc_state state)
 {
   switch (state) {
     case PSUC_SLEEP_OFF:
+      // power is off, psuc is waiting for command
       // attach interrupt handler to power button pin
       attachInterrupt(digitalPinToInterrupt(PSUC_POWER_BUTTON_PIN), power_button_rq, LOW);
 #if 0
@@ -336,6 +355,8 @@ void psu_control(t_psuc_state state)
         change_state(PSUC_POWER_ON);
       break;
     case PSUC_SLEEP_ON:
+      // power is on, waiting for command
+
       // attach interrupt handler to power button pin
       attachInterrupt(digitalPinToInterrupt(PSUC_POWER_BUTTON_PIN), power_button_rq, LOW);
 #if PSUC_USE_CONFIRMATION_GPIO
@@ -374,8 +395,8 @@ void psu_control(t_psuc_state state)
       } else
 #endif
         if (power_btn_is_pressed) {
-          gpio_request_shutdown();
 #if PSUC_USE_CONFIRMATION_GPIO
+          gpio_request_shutdown(true);
           change_state(PSUC_WAIT_GPIO_READ);
 #else
           // confirmation gpio is disabled by config, power off immediately
@@ -402,6 +423,7 @@ void psu_control(t_psuc_state state)
 
       change_state(PSUC_SLEEP_ON);
       break;
+#if PSUC_USE_CONFIRMATION_GPIO
     case PSUC_WAIT_GPIO_READ:
       read_debounced_signals();
       change_state(PSUC_WAIT_GPIO_CONFIRMATION);
@@ -411,6 +433,7 @@ void psu_control(t_psuc_state state)
 #if PSUC_DEBUG
         Serial.println("POWER OFF IS CONFIRMED");
 #endif
+        gpio_request_shutdown(false);
         change_state(PSUC_POWER_OFF);
       } else if (power_btn_is_pressed) {
         change_state(PSUC_WAIT_GPIO_READ);
@@ -421,20 +444,28 @@ void psu_control(t_psuc_state state)
           if (time_alone > PSUC_EMERGENCY_POWER_DOWN_DELAY) {
             // user pressed button > XX seconds
             // emergency case power down !
+            gpio_request_shutdown(false);
             change_state(PSUC_EMERGENCY_POWER_OFF);
-          } else
+          } else {
             // return to normal power on sleep
+            gpio_request_shutdown(false);
             change_state(PSUC_SLEEP_ON);
+          }
         } else {
           unsigned long time_wait = abs(millis() - start_time_wait_gpio) / 1000;
-          if (time_wait >= PSUC_RETURN_TO_POWERON_SLEEP_IN)
+          if (time_wait >= PSUC_RETURN_TO_POWERON_SLEEP_IN) {
+            // shutdown is not confirmed, return to power on state
+            gpio_request_shutdown(false);
             change_state(PSUC_SLEEP_ON);
-          else
+          } else
             change_state(PSUC_WAIT_GPIO_READ);
         }
 
         last_time_wait_alone = millis();
       }
+      break;
+#endif
+    default:
       break;
   }
 }
