@@ -3,7 +3,7 @@
 
 /*******************************************************************************
   Pico PSU Control application
-  Version: 1.02
+  Version: 1.03
   Date: 11-03-2018
   Author: Evgeny Sabelskiy
 
@@ -14,8 +14,9 @@
 
   Revision  Description
   ========  ===========
-  1.02      Fix gpio shutdown request signal deassertion
-  1.01      Add configuration
+  1.03      Added case fan control
+  1.02      Fixed gpio shutdown request deassertion
+  1.01      Added configuration
   1.00      Initial public release (for arduino mini pro 5v)
 *******************************************************************************/
 
@@ -24,6 +25,7 @@
   2. implement watchdog
 */
 
+/* ------------- BEGIN CONFIGURATION ---------------- */
 // set it to 1 if you want to get debugging output on serial console (115200)
 #define PSUC_DEBUG 0
 
@@ -38,11 +40,25 @@
 // set to 1 if you want to use external (case) led
 #define PSUC_USE_EXTERNAL_LED 1
 
+// set to 1 if you want to control speed of (case) fan
+#define PSUC_CONTROL_FAN_SPEED 1
+
+// set fan duty cycle (default is 50%)
+#define PSUC_CONTROL_FAN_DUTY_CYCLE 50
+
 // IMPORTANT!!! this is depends on your ATMEGA->[ATX PS_ON PIN] hardware implementation
 // set it to LOW if you connected cpu directly to PS_ON
 // set to HIGH if you used NPN transistor switch
 #define PSUC_PSON_SIGNAL HIGH
 
+// power down system if user pressed button longer than XX seconds
+#define PSUC_EMERGENCY_POWER_DOWN_DELAY 10
+
+// return to sleep mode if gpio event didn't occur after XX seconds
+#define PSUC_RETURN_TO_POWERON_SLEEP_IN 60
+/* -------------- END CONFIGURATION ----------------- */
+
+/* -------------- BEGIN PIN MAPPING ----------------- */
 // input (irq): external "power on/off" (momentary) button connected to ground
 #define PSUC_POWER_BUTTON_PIN 2
 
@@ -63,11 +79,10 @@
 // external case led
 #define PSUC_EXTERNAL_LED_PIN 6
 
-// power down system if user pressed button longer than XX seconds
-#define PSUC_EMERGENCY_POWER_DOWN_DELAY 10
-
-// return to sleep mode if gpio event didn't occur after XX seconds
-#define PSUC_RETURN_TO_POWERON_SLEEP_IN 60
+// case fan, use pin 11 (asynchronous clock that is not stopped with SLEEP_MODE_PWR_SAVE)
+// change timer configuration if you want to remap this pin
+#define PSUC_CONTROL_FAN_PIN 11
+/* -------------- END PIN MAPPING ------------------- */
 
 enum t_psuc_state {
   // PSUC is initializing
@@ -93,12 +108,32 @@ enum t_psuc_state {
 static volatile t_psuc_state psuc_state;
 byte power_btn_is_pressed;
 byte poweroff_signal_is_received;
+#if PSUC_USE_CONFIRMATION_GPIO
 byte gpio_request_sent;
-
-void change_state(t_psuc_state new_state);
-void reset_signals();
 unsigned long last_time_wait_alone;
 unsigned long start_time_wait_gpio;
+#endif
+
+static void change_state(t_psuc_state new_state);
+static void reset_signals();
+
+static void gpio_request_shutdown(bool on);
+
+static void power_button_rq();
+static void power_down_rq();
+
+static void atx_poweron();
+static void atx_poweroff();
+
+static void read_debounced_signals();
+
+static void case_led_ctrl(byte state);
+static void led_control(t_psuc_state state);
+static void psu_control(t_psuc_state state);
+
+#if PSUC_CONTROL_FAN_SPEED
+static void case_fan_speed(int duty_cycle);
+#endif
 
 void setup() {
   // turn off psu at startup, not very good idea if we'll need to implement watchdog
@@ -129,17 +164,25 @@ void setup() {
   digitalWrite(PSUC_EXTERNAL_LED_PIN, LOW);
 #endif
 
+#if PSUC_CONTROL_FAN_SPEED
+  pinMode(PSUC_CONTROL_FAN_PIN, OUTPUT);
+  // set timer 2 divisor to 8 for (Fast) PWM frequency of 31372.55 Hz
+  TCCR2B = TCCR2B & B11111000 | B00000001;
+#endif
+
   // turn off some parts of cpu to lower power consumption
   power_adc_disable();
   power_spi_disable();
   power_twi_disable();
 
   // set sleep mode
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  set_sleep_mode(SLEEP_MODE_PWR_SAVE);
   // enable sleep bit
   sleep_enable();
 
+#if PSUC_USE_CONFIRMATION_GPIO
   gpio_request_sent = 0;
+#endif
   reset_signals();
 
 #if PSUC_DEBUG
@@ -168,6 +211,13 @@ void atx_poweron()
   Serial.println("atx psu power on");
 #endif
 }
+
+#if PSUC_CONTROL_FAN_SPEED
+void case_fan_speed(int duty_cycle)
+{
+  analogWrite(PSUC_CONTROL_FAN_PIN, ((long) 255 * duty_cycle) / 100);
+}
+#endif
 
 void gpio_request_shutdown(bool on)
 {
@@ -413,6 +463,9 @@ void psu_control(t_psuc_state state)
       atx_poweroff();
       delay(1000);
       change_state(PSUC_SLEEP_OFF);
+#if PSUC_CONTROL_FAN_SPEED
+      case_fan_speed(0);
+#endif
       break;
     case PSUC_EMERGENCY_POWER_OFF:
       change_state(PSUC_POWER_OFF);
@@ -420,7 +473,9 @@ void psu_control(t_psuc_state state)
     case PSUC_POWER_ON:
       atx_poweron();
       delay(1000);
-
+#if PSUC_CONTROL_FAN_SPEED
+      case_fan_speed(PSUC_CONTROL_FAN_DUTY_CYCLE);
+#endif
       change_state(PSUC_SLEEP_ON);
       break;
 #if PSUC_USE_CONFIRMATION_GPIO
